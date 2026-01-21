@@ -3,10 +3,11 @@ import traceback
 from typing import TYPE_CHECKING, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, WebSocketException
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.constants import PER_PAGE
 from app.common.utils import chat_history_ws_channel, websocket_error_wrapper
-from app.common.ws_manager import manager
+from app.common.ws_manager import RedisPubSubManager, manager
 from app.core.dependencies import CurrentWSUser, SessionDep
 from app.modules.chat.service import ChatService
 from app.schemas.chat import (
@@ -95,7 +96,7 @@ async def connect_chat_histories(
 
                 if not isinstance(data, str):
                     raise WebSocketException(1002, "data must be a chat_id in string")
-                con = await manager.subscribe_local(data, websocket)
+                con = await manager.subscribe_local(data, websocket, current_user.id)
                 conns[data] = con
             elif event == "chat.unsubscribe":
                 if not isinstance(data, str):
@@ -140,7 +141,7 @@ async def connect_to_chat(
         }
     )
 
-    local_conn = await manager.subscribe_local(chat_id, websocket)
+    local_conn = await manager.subscribe_local(chat_id, websocket, current_user.id)
     sync_key = chat_history_ws_channel(current_user)
     sync_conn = await manager.subscribe_local(sync_key, websocket)
     try:
@@ -219,6 +220,7 @@ async def connect_to_chat(
                     sync_key,
                     {"event": "chat.update", "data": model.model_dump(mode="json")},
                 )
+                # TODO: The update to the chat should be broadcast to the chat members
             elif event == "chat.reaction.create" or event == "chat.reaction.delete":
                 message_id = raw_data.get("message_id")
                 if not message_id:
@@ -251,6 +253,9 @@ async def connect_to_chat(
                 )
             # END OF EVENTS
 
+            await broadcast_stat_updates_smart(
+                manager, session, chat_id, current_user.id
+            )
             stat_resp = (
                 {
                     "event": "chat.stat",
@@ -262,7 +267,6 @@ async def connect_to_chat(
                     },
                 },
             )
-
             await manager.publish(chat_id, stat_resp)
             await manager.publish(sync_key, stat_resp)
 
@@ -290,3 +294,114 @@ async def connect_to_chat(
             await websocket.close()
         except Exception:
             pass
+
+
+async def broadcast_stat_updates_smart(
+    manager: RedisPubSubManager,
+    session: AsyncSession,
+    chat_id: str,
+    current_user_id: str,
+):
+    """
+    Smart stat updates - only to users who need them immediately.
+    """
+
+    connected_user_ids = await manager.get_channel_connected_users(chat_id)
+
+    print("connected_user_ids", connected_user_ids)
+
+    if not connected_user_ids:
+        return
+
+    target_users = [uid for uid in connected_user_ids if uid != current_user_id]
+
+    user_stats = await ChatService.fetch_unread_stats_for_users(
+        session, chat_id, target_users
+    )
+
+    print("user_stats", user_stats)
+
+    # 5. Publish in parallel (non-blocking)
+    tasks = []
+    for user_id, stats in user_stats.items():
+        sync_key = chat_history_ws_channel(user_id)
+        task = manager.publish(
+            sync_key,
+            {
+                "event": "chat.stat",
+                "data": {
+                    "chat_id": chat_id,
+                    "unread_count": stats["unread_count"],
+                    "has_reply": stats["has_reply"],
+                    "last_message": stats["last_message"],
+                },
+            },
+        )
+        tasks.append(task)
+
+    # Execute all publishes in parallel
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+############ Future scale implementation ###########
+# 1. redis will be used to store chat memebers and unreas count
+# When message created:
+
+
+# async def increment_unread_for_chat(chat_id: str, sender_id: str):
+#     """
+#     Increment unread count in Redis for all members except sender.
+#     O(1) operation per user using Redis sorted sets.
+#     """
+#     # Get member IDs from cache (not DB)
+#     member_ids = await redis.smembers(f"chat:{chat_id}:members")
+
+#     # Batch increment in Redis (VERY fast)
+#     pipe = redis.pipeline()
+#     for member_id in member_ids:
+#         if member_id != sender_id:
+#             pipe.hincrby(f"user:{member_id}:unread", chat_id, 1)
+#     await pipe.execute()
+
+#     # Optionally: Publish lightweight event
+#     await manager.publish(
+#         f"chat:{chat_id}:activity",
+#         {"event": "chat.activity", "data": {"chat_id": chat_id}}
+
+
+# 2. hybrid approach:
+# async def handle_new_message(chat_id, message, sender_id, mentioned_ids):
+#     """
+#     Multi-tier notification strategy
+#     """
+
+#     # Tier 1: Active viewers get full message immediately
+#     await manager.publish(
+#         chat_id,
+#         {"event": "chat.message.create", "data": message}
+#     )
+
+#     # Tier 2: Mentioned users get high-priority notification
+#     if mentioned_ids:
+#         for user_id in mentioned_ids:
+#             sync_key = chat_history_ws_channel(user_id)
+#             await manager.publish(
+#                 sync_key,
+#                 {
+#                     "event": "chat.mention",
+#                     "data": {
+#                         "chat_id": chat_id,
+#                         "message_id": message.id,
+#                     }
+#                 }
+#             )
+
+#     # Tier 3: Update Redis counters (fast, async)
+#     asyncio.create_task(
+#         update_redis_unread_counts(chat_id, sender_id)
+#     )
+
+#     # Tier 4: Connected users get stat updates (batched)
+#     asyncio.create_task(
+#         broadcast_to_connected_users_only(chat_id, sender_id)
+#     )

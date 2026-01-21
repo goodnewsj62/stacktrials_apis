@@ -53,10 +53,16 @@ MessagePayload = dict[str, Any]
 class LocalConnection:
     """Wrapper for per-connection info — can be extended (user id, perms, etc.)"""
 
-    def __init__(self, websocket: WebSocket, connection_id: Optional[str] = None):
+    def __init__(
+        self,
+        websocket: WebSocket,
+        connection_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ):
         self.websocket = websocket
         self.id = connection_id or str(uuid4())
         self._send_lock = asyncio.Lock()  # avoid concurrent websocket.send_json calls
+        self.user_id = user_id
 
     async def send_json(self, payload: MessagePayload):
         """Send JSON to client, protected with lock to avoid concurrency errors"""
@@ -149,7 +155,7 @@ class RedisPubSubManager:
             # Optional: implement retry/backoff here in production
 
     async def subscribe_local(
-        self, channel_id: str, websocket: WebSocket
+        self, channel_id: str, websocket: WebSocket, user_id: Optional[str] = None
     ) -> LocalConnection:
         """
         Register this local WebSocket to receive messages for channel_id.
@@ -205,6 +211,11 @@ class RedisPubSubManager:
                     )
                 # clean up dict entry
                 self._local_subscribers.pop(channel, None)
+
+    async def get_channel_connected_users(self, channel: ChannelName) -> Set[str]:
+        """Get the list of connected users for a channel."""
+        conns = self._local_subscribers.get(channel, set())
+        return {conn.user_id for conn in conns if conn.user_id}
 
     async def _broadcast_to_local(self, channel: ChannelName, payload: MessagePayload):
         """Broadcast payload to all local subscribers of the channel."""

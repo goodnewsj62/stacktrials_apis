@@ -1357,10 +1357,9 @@ class ChatService:
         session: AsyncSession, chat_id: str, user_id: uuid.UUID
     ):
         """
-        Return unread_count + has_reply for a single chat_id
+        Return unread_count + has_reply + last_message for a single chat_id
         """
 
-        # Subquery to get the last read message timestamp for this specific user/chat
         last_read_subq = (
             select(Message.created_at)
             .join(ChatMember, Message.id == ChatMember.last_read_message_id)
@@ -1368,8 +1367,7 @@ class ChatService:
             .scalar_subquery()
         )
 
-        # Main query to count unread messages
-        query = select(
+        stats_query = select(
             func.count(Message.id).label("unread_count"),
             func.bool_or(Message.reply_to_id.isnot(None)).label("has_reply"),
         ).where(
@@ -1377,12 +1375,34 @@ class ChatService:
             or_(last_read_subq.is_(None), Message.created_at > last_read_subq),
         )
 
-        result = await session.exec(query)
+        result = await session.exec(stats_query)
         row: Any = result.one_or_none()
 
+        unread_count = row.unread_count if row else 0
+        has_reply = row.has_reply if row else False
+
+        last_message_query = (
+            select(Message)
+            .join(ChatMember, Message.sender_id == ChatMember.id)
+            .where(Message.chat_id == chat_id)
+            .where(ChatMember.account_id == user_id)
+            .options(
+                selectinload(Message.sender)
+                .selectinload(ChatMember.account)
+                .selectinload(Account.profile),
+                selectinload(Message.reactions)
+                .selectinload(MessageReaction.account)
+                .selectinload(Account.profile),
+            )
+            .order_by(desc(Message.created_at))
+            .limit(1)
+        )
+        last_message = (await session.exec(last_message_query)).first()
+
         return {
-            "unread_count": row.unread_count if row else 0,
-            "has_reply": row.has_reply if row else False,
+            "unread_count": unread_count,
+            "has_reply": has_reply,
+            "last_message": last_message,
         }
 
     @staticmethod
@@ -1390,7 +1410,6 @@ class ChatService:
         session, chat_ids: list[uuid.UUID], user_id: uuid.UUID
     ):
 
-        # Subquery: unread messages grouped by chat
         unread_subq = (
             select(
                 col(Message.chat_id).label("chat_id"),
@@ -1424,14 +1443,117 @@ class ChatService:
 
         rows = results.all()
 
-        # Convert into a dict {chat_id: {unread_count, has_reply}}
+        latest_messages_query = (
+            select(Message)
+            .join(ChatMember, Message.sender_id == ChatMember.id)
+            .where(
+                Message.chat_id.in_(chat_ids),
+                ChatMember.account_id == user_id,
+            )
+            .options(
+                selectinload(Message.sender)
+                .selectinload(ChatMember.account)
+                .selectinload(Account.profile),
+                selectinload(Message.reactions)
+                .selectinload(MessageReaction.account)
+                .selectinload(Account.profile),
+            )
+            .order_by(Message.chat_id, desc(Message.created_at))
+            .distinct(Message.chat_id)
+        )
+
+        latest_messages = (await session.exec(latest_messages_query)).all()
+        latest_message_map = {msg.chat_id: msg for msg in latest_messages}
+
         return {
             row.chat_id: {
                 "unread_count": row.unread_count,
                 "has_reply": row.has_reply,
+                "last_message": latest_message_map.get(row.chat_id),
             }
             for row in rows
         }
+
+    @staticmethod
+    async def fetch_unread_stats_for_users(
+        session: AsyncSession,
+        chat_id: str,
+        user_ids: list[uuid.UUID],
+    ):
+        """
+        Fetch unread stats for multiple users in a single chat.
+        Returns stats per user, where has_reply can differ between users
+        based on their last_read_message_id.
+        Uses maximum of 2 queries.
+        """
+        if not user_ids:
+            return {}
+
+        # Query 1: Get unread stats per user (unread_count and has_reply can differ per user)
+        # Start from Message and join ChatMember to correctly filter unread messages
+        unread_stats_query = (
+            select(
+                ChatMember.account_id.label("user_id"),
+                func.count(Message.id).label("unread_count"),
+                func.bool_or(Message.reply_to_id.isnot(None)).label("has_reply"),
+            )
+            .select_from(Message)
+            .join(ChatMember, ChatMember.chat_id == Message.chat_id)  # type: ignore
+            .where(
+                Message.chat_id == chat_id,
+                ChatMember.account_id.in_(user_ids),
+                or_(
+                    ChatMember.last_read_message_id.is_(None),
+                    Message.created_at
+                    > select(Message.created_at)
+                    .where(Message.id == ChatMember.last_read_message_id)
+                    .correlate(ChatMember)
+                    .scalar_subquery(),
+                ),
+            )
+            .group_by(ChatMember.account_id)
+        )
+
+        stats_results = await session.exec(unread_stats_query)
+        stats_rows = stats_results.all()
+
+        # Query 2: Get latest message in the chat (same for all users)
+        latest_message_query = (
+            select(Message)
+            .where(Message.chat_id == chat_id)
+            .options(
+                selectinload(Message.sender)
+                .selectinload(ChatMember.account)
+                .selectinload(Account.profile),
+                selectinload(Message.reactions)
+                .selectinload(MessageReaction.account)
+                .selectinload(Account.profile),
+            )
+            .order_by(desc(Message.created_at))
+            .limit(1)
+        )
+
+        latest_message = (await session.exec(latest_message_query)).first()
+
+        # Build result dict: {user_id: {unread_count, has_reply, last_message}}
+        stats_map = {
+            row.user_id: {
+                "unread_count": row.unread_count,
+                "has_reply": row.has_reply,
+            }
+            for row in stats_rows
+        }
+
+        # Ensure all requested user_ids are in the result (with default values if no unread messages)
+        result = {}
+        for user_id in user_ids:
+            result[user_id] = {
+                "unread_count": stats_map.get(user_id, {}).get("unread_count", 0),
+                "has_reply": stats_map.get(user_id, {}).get("has_reply", False),
+                "last_message": latest_message,  # Same for all users
+            }
+
+        return result
 
     @staticmethod
     async def list_members(
