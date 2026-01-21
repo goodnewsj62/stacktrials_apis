@@ -5,7 +5,7 @@ from sqlmodel import col, func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.common.constants import PER_PAGE
-from app.common.enum import CourseStatus
+from app.common.enum import CourseStatus, VisibilityType
 from app.common.utils import paginate
 from app.models.courses_model import Course
 from app.models.user_model import Account
@@ -91,7 +91,11 @@ class CreatorService:
         if not user:
             raise HTTPException(404, "user not found")
 
-        query = select(Course).where(Course.account_id == user.id)
+        query = select(Course).where(
+            Course.account_id == user.id,
+            Course.status == CourseStatus.PUBLISHED,
+            Course.visibility == VisibilityType.PUBLIC,
+        )
         if title:
             query = query.where(col(Course.title).ilike(f"%{title}%"))
 
